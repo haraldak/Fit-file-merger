@@ -205,3 +205,7 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# FIT activity files (keep sample dir tracked via .gitkeep)
+*.fit
+!data/samples/.gitkeep

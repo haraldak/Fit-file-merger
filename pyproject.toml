@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "fit-merger"
+version = "0.1.0"
+description = "Merge two Garmin FIT activity files into one"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.8"
+dependencies = []
+
+[project.optional-dependencies]
+dnd = ["tkinterdnd2"]
+map = ["tkintermapview"]
+gui = ["tkinterdnd2", "tkintermapview"]
+
+[project.scripts]
+fit-merge = "fit_merger.cli:main"
+fit-merge-gui = "fit_merger.ui.app:FitMergerApp"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["fit_merger*"]
