@@ -2,7 +2,7 @@
 
 import struct
 from collections import Counter
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from .parser import (
     BASE_TYPE_INFO,
@@ -102,6 +102,48 @@ def merge(data1: bytes, data2: bytes, remove_overlaps: bool = True) -> bytes:
     if sess2 is None:
         raise ValueError("file2 contains no session message")
 
+    # ── detect gaps in file1's GPS record stream ──────────────
+    # A gap is a stretch where file1 has no MESG_RECORD but file2 does.
+    # We stitch those segments in rather than discarding them.
+
+    _RECORD_GAP_SECS = 30
+    _f1_rec_ts: List[int] = sorted(
+        _fv(r, 253) for r in r1
+        if not r.is_def and r.global_num == MESG_RECORD and _fv(r, 253) > 0
+    )
+    _f2_rec_ts: List[int] = sorted(
+        _fv(r, 253) for r in r2
+        if not r.is_def and r.global_num == MESG_RECORD and _fv(r, 253) > 0
+    )
+    _f1_gaps: List[Tuple[int, int]] = [
+        (_f1_rec_ts[i], _f1_rec_ts[i + 1])
+        for i in range(len(_f1_rec_ts) - 1)
+        if _f1_rec_ts[i + 1] - _f1_rec_ts[i] > _RECORD_GAP_SECS
+    ]
+
+    def _in_f1_gap(ts: int) -> bool:
+        return any(gs < ts < ge for gs, ge in _f1_gaps)
+
+    _gap_fill_recs: List[FitRecord] = (
+        [r for r in r2
+         if not r.is_def and r.global_num == MESG_RECORD and _in_f1_gap(_fv(r, 253))]
+        if _f1_gaps else []
+    )
+
+    # ── detect time overlap between the two files ──────────────
+    # When files share a time range we must NOT sum their stats —
+    # that would double-count distance/calories for the shared period.
+
+    _f1_ts_start = _f1_rec_ts[0]  if _f1_rec_ts else 0
+    _f1_ts_end   = _f1_rec_ts[-1] if _f1_rec_ts else 0
+    _f2_ts_start = _f2_rec_ts[0]  if _f2_rec_ts else 0
+    _f2_ts_end   = _f2_rec_ts[-1] if _f2_rec_ts else 0
+    _files_overlap = (
+        _f1_ts_end > 0 and _f2_ts_end > 0
+        and _f2_ts_start < _f1_ts_end
+        and _f1_ts_start < _f2_ts_end
+    )
+
     # ── compute merged session field values ───────────────────
     # Field numbers (FIT profile):
     #   253 = timestamp     2  = start_time
@@ -117,12 +159,21 @@ def merge(data1: bytes, data2: bytes, remove_overlaps: bool = True) -> bytes:
     ts1 = _fv(sess1, 253); ts2 = _fv(sess2, 253)
     merged_ts      = max(ts1, ts2)
     merged_start   = min(_fv(sess1, 2, ts1), _fv(sess2, 2, ts2))
-    merged_elapsed = _safe_add32(_fv(sess1, 7), _fv(sess2, 7))
-    merged_timer   = _safe_add32(_fv(sess1, 8), _fv(sess2, 8))
-    merged_dist    = _safe_add32(_fv(sess1, 9), _fv(sess2, 9))
-    merged_cal     = _safe_add16(_fv(sess1, 11), _fv(sess2, 11))
     merged_ascent  = _safe_add16(_fv(sess1, 22), _fv(sess2, 22))
     merged_descent = _safe_add16(_fv(sess1, 23), _fv(sess2, 23))
+
+    if _files_overlap:
+        # Overlapping time ranges — take the larger value to avoid double-counting
+        # the shared segment (one file is missing a portion the other covers).
+        merged_elapsed = max(_fv(sess1, 7), _fv(sess2, 7))
+        merged_timer   = max(_fv(sess1, 8), _fv(sess2, 8))
+        merged_dist    = max(_fv(sess1, 9), _fv(sess2, 9))
+        merged_cal     = max(_fv(sess1, 11), _fv(sess2, 11))
+    else:
+        merged_elapsed = _safe_add32(_fv(sess1, 7), _fv(sess2, 7))
+        merged_timer   = _safe_add32(_fv(sess1, 8), _fv(sess2, 8))
+        merged_dist    = _safe_add32(_fv(sess1, 9), _fv(sess2, 9))
+        merged_cal     = _safe_add16(_fv(sess1, 11), _fv(sess2, 11))
 
     laps1 = sum(1 for r in r1 if not r.is_def and r.global_num == MESG_LAP)
     laps2 = sum(1 for r in r2 if not r.is_def and r.global_num == MESG_LAP)
@@ -169,7 +220,7 @@ def merge(data1: bytes, data2: bytes, remove_overlaps: bool = True) -> bytes:
 
     _f1_counts = Counter(r.global_num for r in r1 if not r.is_def)
     _f2_counts = Counter(r.global_num for r in r2 if not r.is_def)
-    _time_series = {MESG_LAP, MESG_RECORD, MESG_EVENT, 23}   # 23 = device_info
+    _time_series = {MESG_LAP, MESG_RECORD, MESG_EVENT}
     _skip_from_f2 = {
         gnum for gnum in _f2_counts
         if _f2_counts[gnum] == 1
@@ -208,12 +259,82 @@ def merge(data1: bytes, data2: bytes, remove_overlaps: bool = True) -> bytes:
                 return False
         return True
 
+    # ── prepare gap-fill injection ────────────────────────────
+    # Gap records are inserted inline at the correct timestamp position.
+    # We temporarily override file1's active MESG_RECORD local with
+    # file2's definition, emit the gap records using that local, then
+    # restore the original file1 definition.  This keeps the output in
+    # strict timestamp order so FIT viewers draw a continuous track.
+
+    _gap_fill_ids: set = set()
+    _gf_sorted:    List[FitRecord] = []
+
+    if _gap_fill_recs:
+        _gf_sorted    = sorted(_gap_fill_recs, key=lambda r: _fv(r, 253))
+        _gap_fill_ids = {id(r) for r in _gap_fill_recs}
+        _gf_locals    = {r.local_num for r in _gap_fill_recs}
+
+        # Find file2's MESG_RECORD definition for each gap-fill local —
+        # the last definition before the first gap record is the active one.
+        _f2_rec_def: Dict[int, bytes] = {}
+        for rec in r2:
+            if rec.is_def and rec.local_num in _gf_locals and rec.global_num == MESG_RECORD:
+                _f2_rec_def[rec.local_num] = rec.raw
+            if not rec.is_def and rec.global_num == MESG_RECORD and _in_f1_gap(_fv(rec, 253)):
+                break  # definition is now fixed for all gap records
+
+    _f1_act_rec_local:   Optional[int]   = None  # active MESG_RECORD local in file1
+    _f1_act_rec_def_raw: Optional[bytes] = None  # its most recent definition bytes
+    _gf_idx = 0
+
+    def _relabel(raw: bytes, old: int, new: int) -> bytes:
+        """Rewrite the local-number nibble in a FIT record header byte."""
+        if old == new:
+            return raw
+        b = bytearray(raw)
+        b[0] = (b[0] & 0xF0) | new
+        return bytes(b)
+
+    def _inject_before(ts: int) -> None:
+        """Emit gap-fill records with timestamps < ts at the current stream position."""
+        nonlocal _gf_idx
+        if _gf_idx >= len(_gf_sorted) or _f1_act_rec_local is None:
+            return
+        if _fv(_gf_sorted[_gf_idx], 253) >= ts:
+            return  # fast path: nothing to inject before ts
+
+        target = _f1_act_rec_local
+        prev_f2_local: Optional[int] = None
+
+        while _gf_idx < len(_gf_sorted) and _fv(_gf_sorted[_gf_idx], 253) < ts:
+            rec   = _gf_sorted[_gf_idx]
+            f2loc = rec.local_num
+            # Emit an override definition whenever the gap-fill local changes
+            if f2loc != prev_f2_local and f2loc in _f2_rec_def:
+                out.append(_relabel(_f2_rec_def[f2loc], f2loc, target))
+                prev_f2_local = f2loc
+            out.append(_relabel(rec.raw, f2loc, target))
+            _gf_idx += 1
+
+        # Restore file1's original definition for that local
+        if prev_f2_local is not None and _f1_act_rec_def_raw is not None:
+            out.append(_f1_act_rec_def_raw)
+
     # ── build output record stream ────────────────────────────
 
     out: List[bytes] = []
     skip2 = {id(sess2), id(act2)} if act2 else {id(sess2)}
 
     for rec in r1:
+        # Track file1's active MESG_RECORD definition
+        if rec.is_def and rec.global_num == MESG_RECORD:
+            _f1_act_rec_local   = rec.local_num
+            _f1_act_rec_def_raw = rec.raw
+
+        # Inject gap-fill records just before each file1 MESG_RECORD data record
+        if not rec.is_def and rec.global_num == MESG_RECORD:
+            _inject_before(_fv(rec, 253))
+
         if rec is sess1:
             out.append(_make_patched_sess())
         elif rec is act1:
@@ -221,12 +342,17 @@ def merge(data1: bytes, data2: bytes, remove_overlaps: bool = True) -> bytes:
         elif _keep_from_f1(rec):
             out.append(rec.raw)
 
+    # Drain any gap records that fall after the last file1 MESG_RECORD
+    _inject_before(0x7FFFFFFF)
+
     for rec in r2:
         if id(rec) in skip2:
             continue
+        if id(rec) in _gap_fill_ids:  # already injected at correct position
+            continue
         if rec.global_num in _skip_from_f2:
             continue
-        if rec.global_num == MESG_FILE_ID:
+        if rec.global_num in (MESG_FILE_ID, 23):  # device identity stays with file1
             continue
         if not _keep_from_f2(rec):
             continue

@@ -9,7 +9,7 @@ import os
 import re
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
-from typing import Any, List, Optional, Tuple
+from typing import Any, Callable, List, Optional, Tuple
 
 from fit_merger.core.merger import _find_last, _fv, fmt_time, get_fit_start_ts, merge_all
 from fit_merger.core.parser import FitParser, MESG_RECORD, MESG_SESSION
@@ -42,6 +42,12 @@ FIT_FILETYPES    = [("Garmin FIT files", "*.fit"), ("All files", "*.*")]
 _ARROW_INTERVAL  = 400   # metres between direction arrows
 _GAP_THRESHOLD_M = 200   # metres; gaps below this are not flagged
 
+MAP_STYLES = {
+    "Light":    "https://a.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png",
+    "Standard": "https://a.tile.openstreetmap.org/{z}/{x}/{y}.png",
+    "Dark":     "https://a.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png",
+}
+
 ACTIVITY_COLORS = [
     "#4A90D9",  # blue
     "#5CB85C",  # green
@@ -55,7 +61,68 @@ ACTIVITY_COLORS = [
 _SEMICIRCLE_TO_DEG = 180.0 / (2 ** 31)
 _INVALID_SINT32    = 0x7FFFFFFF
 
-# FIT sport enum → display label (field 5 of SESSION message)
+# ── FIT device lookup tables ───────────────────────────────────────────────
+
+_MANUFACTURER_NAMES: Dict[int, str] = {
+    1: "Garmin", 2: "Garmin (IR)", 4: "SRM", 5: "Quarq",
+    7: "Saris", 11: "Powertap", 32: "Suunto", 38: "Polar",
+    46: "Epson", 64: "Sigma Sport", 86: "Mio", 89: "Wahoo Fitness",
+    255: "Development", 257: "Stages Cycling",
+}
+
+_GARMIN_PRODUCTS: Dict[int, str] = {
+    782:  "Edge 500",           1325: "Edge 810",
+    1555: "Edge 510",           1836: "Edge 1000",
+    1967: "Forerunner 920XT",   2067: "Fēnix 3",
+    2295: "Forerunner 235",     2530: "Fēnix 3 HR",
+    2697: "Forerunner 630",     2888: "Forerunner 935",
+    2900: "Fēnix 5",            3014: "Fēnix 5S",
+    3110: "Forerunner 645",     3121: "Fēnix 5X Plus",
+    3196: "Edge 1030",          3287: "Fēnix 5 Plus",
+    3600: "Edge 130",           3638: "Fēnix 6S",
+    3652: "Vívoactive 4S",      3702: "Fēnix 6",
+    3703: "Fēnix 6X",           3756: "Forerunner 245",
+    3797: "Edge 130 Plus",      3865: "Forerunner 245 Music",
+    3925: "HRM-Pro",            3965: "Venu",
+    4005: "Forerunner 745",     4058: "HRM-Dual",
+    4145: "Edge 1030 Plus",     4169: "Descent Mk2",
+    4312: "Fēnix 6S Pro",       4313: "Fēnix 6 Pro",
+    4314: "Fēnix 6X Pro",       4341: "Venu Sq",
+    4375: "Instinct Solar",     4394: "Forerunner 55",
+    4450: "Fēnix 7",            4480: "Fēnix 7S",
+    4514: "Fēnix 7X",           4556: "Edge 1040",
+    4587: "Venu 2",             4633: "Forerunner 255",
+    4724: "Forerunner 955",     4743: "Epix Gen 2",
+    4804: "Fēnix 7 Pro",        4824: "Forerunner 265",
+    4895: "Forerunner 165",     4957: "Fēnix 8",
+}
+
+
+def _decode_fit_str(v: Any) -> str:
+    if isinstance(v, (bytes, bytearray)):
+        return v.split(b'\x00')[0].decode('utf-8', errors='replace').strip()
+    return ""
+
+
+def _fmt_sw_ver(raw: int) -> str:
+    if raw in (0, 0xFFFF):
+        return "—"
+    return f"{raw // 100}.{raw % 100:02d}"
+
+
+def _product_display(mfr: int, product: int, product_name_bytes: Any = None) -> str:
+    mfr_str = _MANUFACTURER_NAMES.get(mfr, f"Manufacturer {mfr}")
+    if mfr == 1 and product not in (0, 0xFFFF):
+        prod_str = _GARMIN_PRODUCTS.get(product, f"product {product}")
+    elif product not in (0, 0xFFFF):
+        name = _decode_fit_str(product_name_bytes) if product_name_bytes else ""
+        prod_str = name if name else f"product {product}"
+    else:
+        prod_str = ""
+    return f"{mfr_str} · {prod_str}" if prod_str else mfr_str
+
+
+# ── FIT sport enum → display label (field 5 of SESSION message)
 _SPORT_NAMES: dict = {
     0:  "Generic",    1:  "Running",    2:  "Cycling",
     3:  "Transition", 4:  "Fitness",    5:  "Swimming",
@@ -122,9 +189,62 @@ def _load_file_info(path: str) -> FileInfo:
                     gps_track=gps_track, end_ts=end_ts)
 
 
+def _get_file_metadata(path: str) -> dict:
+    """Parse FILE_ID, FILE_CREATOR, and DEVICE_INFO records from a FIT file."""
+    with open(path, "rb") as fh:
+        data = fh.read()
+    parser = FitParser(data)
+    recs   = parser.parse()
+
+    file_id: dict = {}
+    creator: dict = {}
+    devices: Dict[int, dict] = {}
+
+    for r in recs:
+        if r.is_def or not r.values:
+            continue
+        gn = r.global_num
+        if gn == 0 and not file_id:
+            file_id = r.values
+        elif gn == 49 and not creator:
+            creator = r.values
+        elif gn == 23:
+            di = r.values.get(0, 0)
+            if di not in devices:
+                devices[di] = r.values
+
+    return {
+        "file_size":   len(data),
+        "proto_ver":   parser.proto_ver,
+        "profile_ver": parser.profile_ver,
+        "file_id":     file_id,
+        "creator":     creator,
+        "devices":     devices,
+    }
+
+
 def _coords(track: List[GpsPoint]) -> List[Tuple[float, float]]:
     """Strip timestamps – returns plain (lat, lon) list for map API."""
     return [(lat, lon) for lat, lon, _ in track]
+
+
+def _split_segments(track: List[GpsPoint], gap_secs: int = 30) -> List[List[GpsPoint]]:
+    """Split a GPS track into contiguous segments wherever timestamps jump > gap_secs."""
+    if not track:
+        return []
+    segments: List[List[GpsPoint]] = []
+    current = [track[0]]
+    for pt in track[1:]:
+        prev_ts, curr_ts = current[-1][2], pt[2]
+        if prev_ts > 0 and curr_ts > 0 and curr_ts - prev_ts > gap_secs:
+            if len(current) >= 2:
+                segments.append(current)
+            current = [pt]
+        else:
+            current.append(pt)
+    if len(current) >= 2:
+        segments.append(current)
+    return segments
 
 
 # ── Geo helpers ────────────────────────────────────────────────────────────────
@@ -272,7 +392,11 @@ class FitMergerApp(_AppBase):  # type: ignore[misc]
         self.var_output      = tk.StringVar()
         self.var_rm_overlaps = tk.BooleanVar(value=True)
         self.var_show_arrows = tk.BooleanVar(value=False)
+        self.var_map_style   = tk.StringVar(value="Light")
         self._options_open   = True
+
+        # Collapse state for each section (True = expanded)
+        self._sections_open = {"files": True, "map": True, "output": True, "result": True}
 
         self._map_objects:  list = []
         self._pin_images:   list = []
@@ -282,6 +406,7 @@ class FitMergerApp(_AppBase):  # type: ignore[misc]
         self.var_output.trace_add("write", self._update_merge_button)
         self.var_show_arrows.trace_add("write",  lambda *_: self._refresh_map(fit=False))
         self.var_rm_overlaps.trace_add("write",  lambda *_: self._refresh_map(fit=False))
+        self.var_map_style.trace_add("write",    lambda *_: self._update_tile_server())
 
     # ── UI construction ────────────────────────────────────────────────────────
 
@@ -304,10 +429,28 @@ class FitMergerApp(_AppBase):  # type: ignore[misc]
         bot = tk.Frame(self, bg="#EBEBEB")
         bot.grid(row=2, column=0, sticky="ew", padx=PAD, pady=(3, PAD))
         bot.columnconfigure(0, weight=1)
-        # self._build_options_section(bot)
-        self._build_output_section(bot)
-        self._build_merge_button(bot)
+        self._build_output_merge_section(bot)
         self._build_result_section(bot)
+
+    # ── Collapse helper ────────────────────────────────────────────────────────
+
+    def _make_section_toggle(
+        self,
+        key: str,
+        content: tk.Frame,
+        arrow_lbl: tk.Label,
+        show_fn: Callable[[], None],
+        hide_fn: Callable[[], None],
+    ) -> Callable[[Any], None]:
+        def _toggle(_event: Any = None) -> None:
+            self._sections_open[key] = not self._sections_open[key]
+            if self._sections_open[key]:
+                show_fn()
+                arrow_lbl.config(text="\u25b2")
+            else:
+                hide_fn()
+                arrow_lbl.config(text="\u25be")
+        return _toggle
 
     # ── Files section ──────────────────────────────────────────────────────────
 
@@ -316,17 +459,32 @@ class FitMergerApp(_AppBase):  # type: ignore[misc]
                          highlightbackground="#D0D0D0", highlightthickness=1)
         outer.pack(fill="x", pady=(0, 6))
 
-        hdr = tk.Frame(outer, bg="#F5F5F5")
+        hdr = tk.Frame(outer, bg="#F5F5F5", cursor="hand2")
         hdr.pack(fill="x")
-        tk.Label(hdr, text="\U0001f5c2  Files", bg="#F5F5F5",
-                 font=("Segoe UI", 10, "bold"), anchor="w", padx=8, pady=5).pack(side="left")
+        lbl_title = tk.Label(hdr, text="\U0001f5c2  Files", bg="#F5F5F5",
+                             font=("Segoe UI", 10, "bold"), anchor="w", padx=8, pady=5)
+        lbl_title.pack(side="left")
+        arrow = tk.Label(hdr, text="\u25b2", bg="#F5F5F5", font=("Segoe UI", 9), padx=8)
+        arrow.pack(side="right")
         ttk.Button(hdr, text="Sort by time \u25be",
                    command=self._sort_by_time).pack(side="right", padx=6, pady=3)
 
-        self._files_container = tk.Frame(outer, bg="white", padx=8, pady=4)
+        # Content wrapper
+        self._files_section_content = tk.Frame(outer, bg="white")
+        self._files_section_content.pack(fill="x")
+
+        self._files_container = tk.Frame(self._files_section_content, bg="white", padx=8, pady=4)
         self._files_container.pack(fill="x")
 
-        self._gap_frame = tk.Frame(outer, bg="#FFF8E1")
+        self._gap_frame = tk.Frame(self._files_section_content, bg="#FFF8E1")
+
+        toggle = self._make_section_toggle(
+            "files", self._files_section_content, arrow,
+            lambda: self._files_section_content.pack(fill="x"),
+            lambda: self._files_section_content.pack_forget(),
+        )
+        for w in (hdr, lbl_title, arrow):
+            w.bind("<Button-1>", toggle)
 
         if _DND_AVAILABLE:
             outer.drop_target_register(DND_FILES)
@@ -449,6 +607,12 @@ class FitMergerApp(_AppBase):  # type: ignore[misc]
         lbl_pace.pack(side="left", padx=(0, 4))
         lbl_pace.bind("<Button-1>", _on_row_click)
 
+        # ── Info ──
+        tk.Button(row, text="ℹ", width=2, relief="flat", bd=0,
+                  bg=row_bg, fg="#888888", font=("Segoe UI", 9), cursor="hand2",
+                  activeforeground="#2E6DA4", activebackground=row_bg,
+                  command=lambda i=idx: self._show_metadata_popup(i)).pack(side="left", padx=(0, 1))
+
         # ── Eye toggle ──
         eye_fg = color if visible else "#CCCCCC"
         tk.Button(row, text="\U0001f441", width=2, relief="flat", bd=0,
@@ -496,13 +660,22 @@ class FitMergerApp(_AppBase):  # type: ignore[misc]
         outer.columnconfigure(0, weight=1)
         outer.rowconfigure(1, weight=1)
 
-        hdr = tk.Frame(outer, bg="#F5F5F5")
+        hdr = tk.Frame(outer, bg="#F5F5F5", cursor="hand2")
         hdr.grid(row=0, column=0, sticky="ew")
-        tk.Label(hdr, text="\U0001f5fa  Map Preview", bg="#F5F5F5",
-                 font=("Segoe UI", 10, "bold"), anchor="w", padx=8, pady=5).pack(side="left")
+        lbl_title = tk.Label(hdr, text="\U0001f5fa  Map Preview", bg="#F5F5F5",
+                             font=("Segoe UI", 10, "bold"), anchor="w", padx=8, pady=5)
+        lbl_title.pack(side="left")
+        arrow = tk.Label(hdr, text="\u25b2", bg="#F5F5F5", font=("Segoe UI", 9), padx=8)
+        arrow.pack(side="right")
 
-        map_inner = tk.Frame(outer, bg="white")
-        map_inner.grid(row=1, column=0, sticky="nsew", padx=8, pady=6)
+        # Content wrapper (grid-managed so it can be grid_remove'd)
+        self._map_section_content = tk.Frame(outer, bg="white")
+        self._map_section_content.grid(row=1, column=0, sticky="nsew")
+        self._map_section_content.columnconfigure(0, weight=1)
+        self._map_section_content.rowconfigure(0, weight=1)
+
+        map_inner = tk.Frame(self._map_section_content, bg="white")
+        map_inner.grid(row=0, column=0, sticky="nsew", padx=8, pady=6)
         map_inner.columnconfigure(0, weight=1)
         map_inner.rowconfigure(0, weight=1)
 
@@ -510,8 +683,7 @@ class FitMergerApp(_AppBase):  # type: ignore[misc]
             self._map_widget = tkintermapview.TkinterMapView(
                 map_inner, width=460, height=260, corner_radius=0)
             self._map_widget.grid(row=0, column=0, sticky="nsew")
-            self._map_widget.set_tile_server(
-                "https://a.tile.openstreetmap.org/{z}/{x}/{y}.png")
+            self._map_widget.set_tile_server(MAP_STYLES[self.var_map_style.get()])
             self._map_widget.set_zoom(4)
         else:
             self._map_widget = None
@@ -523,13 +695,32 @@ class FitMergerApp(_AppBase):  # type: ignore[misc]
                                text="Map preview requires:\npip install tkintermapview",
                                fill="#888888", font=("Segoe UI", 10), justify="center")))
 
-        self._legend_frame = tk.Frame(outer, bg="white")
-        self._legend_frame.grid(row=2, column=0, sticky="ew", padx=8, pady=(0, 2))
+        self._legend_frame = tk.Frame(self._map_section_content, bg="white")
+        self._legend_frame.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 2))
 
-        arrows_row = tk.Frame(outer, bg="white")
-        arrows_row.grid(row=3, column=0, sticky="ew", padx=8, pady=(0, 6))
+        arrows_row = tk.Frame(self._map_section_content, bg="white")
+        arrows_row.grid(row=2, column=0, sticky="ew", padx=8, pady=(0, 6))
         ttk.Checkbutton(arrows_row, text="Show direction arrows",
-                        variable=self.var_show_arrows).pack(anchor="w")
+                        variable=self.var_show_arrows).pack(side="left")
+        tk.Label(arrows_row, text="Map style:", bg="white",
+                 font=("Segoe UI", 9)).pack(side="left", padx=(16, 4))
+        ttk.Combobox(arrows_row, textvariable=self.var_map_style,
+                     values=list(MAP_STYLES.keys()), state="readonly",
+                     width=10).pack(side="left")
+
+        toggle = self._make_section_toggle(
+            "map", self._map_section_content, arrow,
+            lambda: self._map_section_content.grid(row=1, column=0, sticky="nsew"),
+            lambda: self._map_section_content.grid_remove(),
+        )
+        for w in (hdr, lbl_title, arrow):
+            w.bind("<Button-1>", toggle)
+
+    def _update_tile_server(self) -> None:
+        if not _MAP_AVAILABLE or self._map_widget is None:
+            return
+        url = MAP_STYLES.get(self.var_map_style.get(), MAP_STYLES["Light"])
+        self._map_widget.set_tile_server(url)
 
     def _refresh_map(self, fit: bool = True) -> None:
         if not _MAP_AVAILABLE or self._map_widget is None:
@@ -564,9 +755,26 @@ class FitMergerApp(_AppBase):  # type: ignore[misc]
                 self._add_legend_entry(i, color, active=False)
                 continue
 
-            # Trim track to remove temporal overlap with previous file
+            # Trim track to remove temporal overlap with previous file,
+            # but preserve points that fill gaps in the previous file's GPS track.
             if rm_overlaps and prev_end_ts > 0:
-                display_track = [pt for pt in fi.gps_track if pt[2] == 0 or pt[2] > prev_end_ts]
+                prev_fi = self._files[i - 1] if i > 0 else None
+                if prev_fi and prev_fi.gps_track:
+                    prev_ts = sorted(pt[2] for pt in prev_fi.gps_track if pt[2] > 0)
+                    prev_gaps = [
+                        (prev_ts[j], prev_ts[j + 1])
+                        for j in range(len(prev_ts) - 1)
+                        if prev_ts[j + 1] - prev_ts[j] > 30
+                    ] if len(prev_ts) > 1 else []
+                else:
+                    prev_gaps = []
+
+                display_track = [
+                    pt for pt in fi.gps_track
+                    if pt[2] == 0
+                    or pt[2] > prev_end_ts
+                    or any(gs < pt[2] < ge for gs, ge in prev_gaps)
+                ]
             else:
                 display_track = fi.gps_track
 
@@ -585,15 +793,17 @@ class FitMergerApp(_AppBase):  # type: ignore[misc]
             else:
                 draw_color, draw_width = color, 3
 
-            path_obj = self._map_widget.set_path(_coords(display_track),
-                                                  color=draw_color, width=draw_width)
-            self._map_objects.append(path_obj)
+            segments = _split_segments(display_track)
+            for seg in segments:
+                path_obj = self._map_widget.set_path(_coords(seg),
+                                                      color=draw_color, width=draw_width)
+                self._map_objects.append(path_obj)
 
             all_lats.extend(pt[0] for pt in display_track)
             all_lons.extend(pt[1] for pt in display_track)
 
-            # Start marker
-            slat, slon, _ = display_track[0]
+            # Start marker (first point of first segment, or display_track[0])
+            slat, slon, _ = (segments[0][0] if segments else display_track[0])
             if _PIL_AVAILABLE:
                 pin = _make_circle_marker(color, i + 1, size=20)
                 self._pin_images.append(pin)
@@ -677,13 +887,27 @@ class FitMergerApp(_AppBase):  # type: ignore[misc]
             self._opts_content.pack_forget()
             self._lbl_toggle.config(text="\u25be")
 
-    # ── Output section ─────────────────────────────────────────────────────────
+    # ── Output + Merge section (combined collapsible card) ─────────────────────
 
-    def _build_output_section(self, parent: tk.Frame) -> None:
+    def _build_output_merge_section(self, parent: tk.Frame) -> None:
         outer = tk.Frame(parent, bg="white",
                          highlightbackground="#D0D0D0", highlightthickness=1)
         outer.pack(fill="x", pady=(0, 6))
-        inner = tk.Frame(outer, bg="white", padx=8, pady=8)
+
+        hdr = tk.Frame(outer, bg="#F5F5F5", cursor="hand2")
+        hdr.pack(fill="x")
+        lbl_title = tk.Label(hdr, text="\U0001f4be  Output & Merge", bg="#F5F5F5",
+                             font=("Segoe UI", 10, "bold"), anchor="w", padx=8, pady=5)
+        lbl_title.pack(side="left")
+        arrow = tk.Label(hdr, text="\u25b2", bg="#F5F5F5", font=("Segoe UI", 9), padx=8)
+        arrow.pack(side="right")
+
+        # Content wrapper
+        self._output_section_content = tk.Frame(outer, bg="white")
+        self._output_section_content.pack(fill="x")
+
+        # Output file row
+        inner = tk.Frame(self._output_section_content, bg="white", padx=8, pady=8)
         inner.pack(fill="x")
         inner.columnconfigure(1, weight=1)
         tk.Label(inner, text="Output file:", bg="white",
@@ -693,40 +917,53 @@ class FitMergerApp(_AppBase):  # type: ignore[misc]
         ttk.Button(inner, text="Browse\u2026",
                    command=self._browse_output).grid(row=0, column=2, padx=(6, 0))
 
-    # ── Merge button ───────────────────────────────────────────────────────────
-
-    def _build_merge_button(self, parent: tk.Frame) -> None:
-        frame = tk.Frame(parent, bg="#EBEBEB")
-        frame.pack(fill="x", pady=(0, 6))
+        # Merge button
+        btn_frame = tk.Frame(self._output_section_content, bg="white", padx=8)
+        btn_frame.pack(fill="x", pady=(0, 8))
         self.btn_merge = tk.Button(
-            frame, text="Merge into single activity",
+            btn_frame, text="Merge into single activity",
             command=self._on_merge, state="disabled",
             bg="#9EAFC2", fg="white", font=("Segoe UI", 11, "bold"),
             relief="flat", padx=20, pady=10, cursor="hand2",
             activebackground="#1E5D94", activeforeground="white")
         self.btn_merge.pack(fill="x")
 
+        toggle = self._make_section_toggle(
+            "output", self._output_section_content, arrow,
+            lambda: self._output_section_content.pack(fill="x"),
+            lambda: self._output_section_content.pack_forget(),
+        )
+        for w in (hdr, lbl_title, arrow):
+            w.bind("<Button-1>", toggle)
+
     # ── Result section ─────────────────────────────────────────────────────────
 
     def _build_result_section(self, parent: tk.Frame) -> None:
         self._result_outer = tk.Frame(parent, bg="white",
                                        highlightbackground="#D0D0D0", highlightthickness=1)
-        self._result_outer.pack(fill="x", pady=(0, 6))   # always visible
+        self._result_outer.pack(fill="x", pady=(0, 6))
 
-        hdr = tk.Frame(self._result_outer, bg="#F5F5F5")
+        hdr = tk.Frame(self._result_outer, bg="#F5F5F5", cursor="hand2")
         hdr.pack(fill="x")
-        tk.Label(hdr, text="\U0001f4ca  Result", bg="#F5F5F5",
-                 font=("Segoe UI", 10, "bold"), anchor="w", padx=8, pady=5).pack(side="left")
+        lbl_title = tk.Label(hdr, text="\U0001f4ca  Result", bg="#F5F5F5",
+                             font=("Segoe UI", 10, "bold"), anchor="w", padx=8, pady=5)
+        lbl_title.pack(side="left")
+        arrow = tk.Label(hdr, text="\u25b2", bg="#F5F5F5", font=("Segoe UI", 9), padx=8)
+        arrow.pack(side="right")
+
+        # Content wrapper
+        self._result_section_content = tk.Frame(self._result_outer, bg="white")
+        self._result_section_content.pack(fill="x")
 
         # Placeholder shown when no files are loaded
         self._result_placeholder = tk.Label(
-            self._result_outer,
+            self._result_section_content,
             text="Add at least 2 files to preview the merged result",
             bg="white", fg="#AAAAAA", font=("Segoe UI", 9), pady=10)
         self._result_placeholder.pack()
 
         # Stats grid (hidden until files are loaded)
-        self._result_content = tk.Frame(self._result_outer, bg="white", padx=12, pady=8)
+        self._result_content = tk.Frame(self._result_section_content, bg="white", padx=12, pady=8)
         self._result_content.columnconfigure(0, weight=1)
         self._result_content.columnconfigure(1, weight=1)
 
@@ -750,11 +987,19 @@ class FitMergerApp(_AppBase):  # type: ignore[misc]
         self.lbl_after_time.pack(anchor="w")
         self.lbl_after_pace.pack(anchor="w")
 
-        wf = tk.Frame(self._result_outer, bg="white")
+        wf = tk.Frame(self._result_section_content, bg="white")
         wf.pack(fill="x", padx=12, pady=(0, 8))
         self.lbl_written = tk.Label(wf, text="", bg="white",
                                      font=("Segoe UI", 9, "bold"), fg="#27AE60")
         self.lbl_written.pack(anchor="center")
+
+        toggle = self._make_section_toggle(
+            "result", self._result_section_content, arrow,
+            lambda: self._result_section_content.pack(fill="x"),
+            lambda: self._result_section_content.pack_forget(),
+        )
+        for w in (hdr, lbl_title, arrow):
+            w.bind("<Button-1>", toggle)
 
     # ── Live result preview ────────────────────────────────────────────────────
 
@@ -774,11 +1019,32 @@ class FitMergerApp(_AppBase):  # type: ignore[misc]
 
         self.lbl_before_count.config(text=f"\u2022 {len(self._files)} activities")
         self.lbl_before_dist.config( text=f"\u2022 {total_d:.2f} km total")
-        self.lbl_after_dist.config(  text=f"\u25cf {total_d:.2f} km")
-        self.lbl_after_time.config(  text=f"  {fmt_time(total_t)}")
 
-        if total_d > 0 and total_t > 0:
-            pace_s = (total_t / 1000) / total_d
+        # Estimate merged stats: when two files share a time range (one fills the
+        # other's gap), summing double-counts \u2014 take the larger value instead.
+        merged_d = self._files[0].distance_km
+        merged_t = self._files[0].timer_ms
+        for j in range(1, len(self._files)):
+            prev_fi = self._files[j - 1]
+            curr_fi = self._files[j]
+            p_start = prev_fi.gps_track[0][2] if prev_fi.gps_track else 0
+            p_end   = prev_fi.end_ts
+            c_start = curr_fi.gps_track[0][2] if curr_fi.gps_track else 0
+            c_end   = curr_fi.end_ts
+            overlap = (p_end > 0 and c_end > 0
+                       and c_start < p_end and p_start < c_end)
+            if overlap:
+                merged_d = max(merged_d, curr_fi.distance_km)
+                merged_t = max(merged_t, curr_fi.timer_ms)
+            else:
+                merged_d += curr_fi.distance_km
+                merged_t += curr_fi.timer_ms
+
+        self.lbl_after_dist.config(text=f"\u25cf {merged_d:.2f} km")
+        self.lbl_after_time.config(text=f"  {fmt_time(merged_t)}")
+
+        if merged_d > 0 and merged_t > 0:
+            pace_s = (merged_t / 1000) / merged_d
             self.lbl_after_pace.config(
                 text=f"Avg pace: {int(pace_s // 60)}:{int(pace_s % 60):02d} /km")
         else:
@@ -872,6 +1138,133 @@ class FitMergerApp(_AppBase):  # type: ignore[misc]
         self._selected_idx = None if self._selected_idx == idx else idx
         self._refresh_files_ui()
         self._refresh_map(fit=False)
+
+    def _show_metadata_popup(self, idx: int) -> None:
+        fi = self._files[idx]
+        try:
+            meta = _get_file_metadata(fi.path)
+        except Exception as exc:
+            messagebox.showerror("Error", f"Could not read metadata:\n{exc}")
+            return
+
+        win = tk.Toplevel(self)
+        win.title(f"Info — {os.path.basename(fi.path)}")
+        win.resizable(False, False)
+        win.grab_set()
+        win.configure(bg="white")
+
+        color = _color_for(idx)
+
+        # ── helpers ──────────────────────────────────────────
+        def _section(title: str) -> tk.Frame:
+            tk.Frame(win, bg="#E8E8E8", height=1).pack(fill="x", padx=0)
+            hf = tk.Frame(win, bg="#F5F5F5")
+            hf.pack(fill="x")
+            tk.Label(hf, text=title.upper(), bg="#F5F5F5",
+                     font=("Segoe UI", 8, "bold"), fg="#666666",
+                     padx=14, pady=4).pack(anchor="w")
+            cf = tk.Frame(win, bg="white", padx=14, pady=2)
+            cf.pack(fill="x")
+            return cf
+
+        def _row(parent: tk.Frame, label: str, value: str) -> None:
+            if not value or value == "—":
+                return
+            rf = tk.Frame(parent, bg="white")
+            rf.pack(fill="x", pady=1)
+            tk.Label(rf, text=label, bg="white", fg="#888888",
+                     font=("Segoe UI", 9), width=18, anchor="w").pack(side="left")
+            tk.Label(rf, text=value, bg="white", fg="#1A1A1A",
+                     font=("Segoe UI", 9), anchor="w").pack(side="left")
+
+        # ── header ───────────────────────────────────────────
+        hdr = tk.Frame(win, bg=color, padx=14, pady=10)
+        hdr.pack(fill="x")
+        tk.Label(hdr, text=os.path.basename(fi.path), bg=color, fg="white",
+                 font=("Segoe UI", 10, "bold"), anchor="w").pack(anchor="w")
+
+        # ── File ─────────────────────────────────────────────
+        cf = _section("File")
+        _row(cf, "Location", os.path.dirname(os.path.abspath(fi.path)))
+        _row(cf, "File size", f"{meta['file_size'] / 1024:.1f} KB  ({meta['file_size']:,} bytes)")
+        proto = meta['proto_ver']
+        _row(cf, "FIT protocol", f"{proto >> 4}.{proto & 0xF}")
+        _row(cf, "FIT profile", f"{meta['profile_ver'] / 100:.2f}")
+
+        # ── Activity ─────────────────────────────────────────
+        cf = _section("Activity")
+        _row(cf, "Sport", fi.sport)
+        _row(cf, "Start", fi.display_datetime)
+        _row(cf, "Distance", f"{fi.distance_km:.3f} km" if fi.distance_km else "—")
+        _row(cf, "Duration", fmt_time(fi.timer_ms) if fi.timer_ms else "—")
+        if fi.distance_km > 0 and fi.timer_ms > 0:
+            pace_s = (fi.timer_ms / 1000) / fi.distance_km
+            _row(cf, "Avg pace", f"{int(pace_s // 60)}:{int(pace_s % 60):02d} /km")
+        gps_count = len(fi.gps_track)
+        _row(cf, "GPS points", str(gps_count) if gps_count else "—")
+
+        # ── Recording device (device_index 0) ────────────────
+        fid  = meta["file_id"]
+        dev0 = meta["devices"].get(0, {})
+        mfr     = dev0.get(2) or fid.get(1, 0xFFFF)
+        product = dev0.get(4) or fid.get(2, 0xFFFF)
+        sw      = dev0.get(5, 0)
+        serial  = dev0.get(3) or fid.get(3, 0)
+
+        if mfr not in (0, 0xFFFF):
+            cf = _section("Recording Device")
+            mfr_name = _MANUFACTURER_NAMES.get(mfr, f"Manufacturer {mfr}")
+            _row(cf, "Manufacturer", mfr_name)
+            if product not in (0, 0xFFFF):
+                if mfr == 1:
+                    prod_str = _GARMIN_PRODUCTS.get(product, f"product {product}")
+                else:
+                    prod_str = _decode_fit_str(fid.get(8)) or f"product {product}"
+                _row(cf, "Product", prod_str)
+            _row(cf, "Firmware", _fmt_sw_ver(sw))
+            if serial not in (0, 0xFFFFFFFF):
+                _row(cf, "Serial no.", str(serial))
+
+        # ── Paired devices (index 1+) ─────────────────────────
+        paired = [
+            (di, dv) for di, dv in sorted(meta["devices"].items())
+            if di != 0
+            and dv.get(2, 0xFFFF) not in (0, 0xFFFF)
+            and dv.get(4, 0xFFFF) not in (0, 0xFFFF)
+        ]
+        if paired:
+            cf = _section("Paired Devices")
+            for di, dv in paired:
+                m = dv.get(2, 0xFFFF)
+                p = dv.get(4, 0xFFFF)
+                s = dv.get(5, 0)
+                label = f"Device {di}"
+                val = _product_display(m, p)
+                if s not in (0, 0xFFFF):
+                    val += f"  ·  fw {_fmt_sw_ver(s)}"
+                _row(cf, label, val)
+
+        # ── FILE_CREATOR (app that created the file) ──────────
+        cr = meta["creator"]
+        cr_sw = cr.get(0, 0)
+        cr_name = _decode_fit_str(cr.get(2)) if cr.get(2) else ""
+        if cr_sw not in (0, 0xFFFF) or cr_name:
+            cf = _section("File Creator")
+            if cr_name:
+                _row(cf, "Application", cr_name)
+            _row(cf, "Software ver.", _fmt_sw_ver(cr_sw))
+
+        # ── close button ─────────────────────────────────────
+        tk.Frame(win, bg="#E8E8E8", height=1).pack(fill="x")
+        bf = tk.Frame(win, bg="white", padx=14, pady=8)
+        bf.pack(fill="x")
+        ttk.Button(bf, text="Close", command=win.destroy).pack(side="right")
+
+        # centre the popup over the main window
+        win.update_idletasks()
+        mx = self.winfo_rootx() + (self.winfo_width()  - win.winfo_width())  // 2
+        my = self.winfo_rooty() + (self.winfo_height() - win.winfo_height()) // 2
+        win.geometry(f"+{mx}+{my}")
 
     def _on_drop(self, event: Any) -> None:
         self._add_paths(_parse_dnd_paths(event.data))

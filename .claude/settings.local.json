@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:developer.garmin.com)",
+      "Bash(python3 merge_fit.py 22249762828_ACTIVITY.fit 22249764713_ACTIVITY.fit output.fit)",
+      "Bash(grep -E \"\\\\.\\(py|js|ts|tsx|jsx|html|css|txt|cfg|ini|toml\\)$\")",
+      "Bash(ls -lh /c/code/Fit/*.fit)",
+      "Bash(python -c \"from fit_merger.core.merger import merge; print\\(''core imports OK''\\)\")",
+      "Bash(python -c \"from fit_merger.cli import main; print\\(''cli imports OK''\\)\")",
+      "Bash(python -m fit_merger.cli --help)",
+      "Bash(python -m pytest tests/ -v)",
+      "Bash(python -m fit_merger.cli 22249762828_ACTIVITY.fit 22249764713_ACTIVITY.fit /tmp/test_out.fit)",
+      "Bash(python -m fit_merger.cli -o /tmp/test_out.fit 22249762828_ACTIVITY.fit 22249764713_ACTIVITY.fit)",
+      "Bash(python -c ' *)",
+      "Bash(python *)"
+    ]
+  }
+}
